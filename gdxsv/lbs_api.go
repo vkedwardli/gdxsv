@@ -91,6 +91,7 @@ func (lbs *Lbs) RegisterHTTPHandlers() {
 						user := &onlineUser{
 							UserID:     u.UserID,
 							Name:       u.Name,
+							PilotName:  u.PilotName,
 							Team:       teamName(int(u.Team)),
 							LobbyID:    lobbyID,
 							BattleCode: "",
