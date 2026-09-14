@@ -204,5 +204,38 @@ func TestLbs_P2PMatchingReport(t *testing.T) {
 	assertEq(t, 1, len(replays))
 	assertEq(t, 2, replays[0].RenpoWin) // 2 rounds won by team 1
 	assertEq(t, 0, replays[0].ZeonWin)
-}
 
+	// A legacy peer on the other team reports the opposite winner for a
+	// timeout. Reconcile stored rounds rather than replacing the first report.
+	user2, cancel2 := prepareLoggedInUser(t, lbs, PlatformConsole, GameDiskDC2, DBUser{
+		UserID: "U2",
+		Name:   "N2",
+	})
+	defer cancel2()
+	report.RoundData[0].WinTeam = 2
+	bin, err = proto.Marshal(report)
+	must(t, err)
+	buf.Reset()
+	zw = zlib.NewWriter(&buf)
+	_, err = zw.Write(bin)
+	must(t, err)
+	must(t, zw.Close())
+	user2.MustWriteMessage(&LbsMessage{
+		Command:  lbsP2PMatchingReport,
+		BodySize: uint16(buf.Len()),
+		Body:     buf.Bytes(),
+	})
+	waitFor(t, 2*time.Second, func() bool {
+		rec, err := getDB().GetBattleRecordUser(battleCode, "U2")
+		return err == nil && rec.RoundWin == "-1,1"
+	})
+	for _, uid := range []string{"U1", "U2"} {
+		rec, err := getDB().GetBattleRecordUser(battleCode, uid)
+		must(t, err)
+		assertEq(t, "-1,1", rec.RoundWin)
+	}
+	replays, err = getDB().FindReplay(q)
+	must(t, err)
+	assertEq(t, 1, replays[0].RenpoWin)
+	assertEq(t, 0, replays[0].ZeonWin)
+}

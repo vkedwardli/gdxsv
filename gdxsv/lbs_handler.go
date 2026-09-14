@@ -1800,6 +1800,16 @@ var _ = register(lbsP2PMatchingReport, func(p *LbsPeer, m *LbsMessage) {
 
 		// Reports arrive redundantly from all 4 participants; Close is
 		// idempotent so only the first one takes effect.
+		// Fold final outcomes too: another legacy peer may reveal a timeout
+		// after the first report closed the stream, or repair a lost UDP result.
+		if session, ok := spectatorRegistry.Get(report.BattleCode, report.SessionId); ok {
+			for i, round := range report.RoundData {
+				if i >= maxSpectatorRounds {
+					break
+				}
+				session.PushRoundResult(int32(i), round)
+			}
+		}
 		spectatorRegistry.Close(report.BattleCode, report.CloseReason, report.DisconnectedPeerId)
 
 		if report.CloseReason == "game_end" {
@@ -1849,12 +1859,9 @@ var _ = register(lbsP2PMatchingReport, func(p *LbsPeer, m *LbsMessage) {
 			if err != nil {
 				p.logger.Warn("GetBattleRecordsByCode for round_data", zap.Error(err))
 			} else if len(records) > 0 {
-				// Build round_win string (common for all players)
-				var roundWinParts []string
-				for _, rd := range report.RoundData {
-					roundWinParts = append(roundWinParts, strconv.Itoa(int(rd.WinTeam)))
-				}
-				roundWin := strings.Join(roundWinParts, ",")
+				// Merge instead of letting the last legacy timeout report choose
+				// an arbitrary winner. Draws survive subsequent duplicate reports.
+				roundWin := mergeBattleRoundWin(records[0].RoundWin, report.RoundData)
 
 				// Sort records by pos
 				sort.Slice(records, func(i, j int) bool {

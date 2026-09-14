@@ -121,14 +121,14 @@ func TestSpectatorSession_PushRoundEvent_DedupsByFrame(t *testing.T) {
 	assertEq(t, 2, len(s.log.RoundData))
 }
 
-func TestSpectatorSession_PushRoundResult_FirstWinTeamWins(t *testing.T) {
+func TestSpectatorSession_PushRoundResult_LegacyDisagreementBecomesDraw(t *testing.T) {
 	s := newTestSpectatorSession()
 	s.PushRoundEvent(0, 111) // round 0 exists
 
 	s.PushRoundResult(0, &proto.BattleLogRound{WinTeam: 1, UsedMs: []int32{3}})
-	s.PushRoundResult(0, &proto.BattleLogRound{WinTeam: 2, UsedMs: []int32{9}}) // redundant peer: ignored
+	s.PushRoundResult(0, &proto.BattleLogRound{WinTeam: 2, UsedMs: []int32{9}}) // opposite legacy timeout report
 
-	assertEq(t, int32(1), s.log.RoundData[0].WinTeam)
+	assertEq(t, roundOutcomeDraw, s.log.RoundData[0].WinTeam)
 	assertEq(t, []int32{3}, s.log.RoundData[0].UsedMs)
 }
 
