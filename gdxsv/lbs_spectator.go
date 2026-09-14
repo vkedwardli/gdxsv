@@ -297,9 +297,8 @@ func (s *SpectatorSession) PushRoundEvent(frame int32, randomValue uint64) bool 
 	return true
 }
 
-// PushRoundResult records a round's outcome once it becomes known. Mirrors
-// the client's "first WinTeam transition wins" semantics: once a round's
-// result is set it is not overwritten by a later (redundant) push.
+// PushRoundResult merges redundant outcomes. New clients report draws
+// explicitly; conflicting legacy winners also become a sticky draw.
 func (s *SpectatorSession) PushRoundResult(roundIndex int32, round *proto.BattleLogRound) bool {
 	if roundIndex < 0 || roundIndex >= maxSpectatorRounds || round.GetWinTeam() == 0 {
 		return false
@@ -308,20 +307,33 @@ func (s *SpectatorSession) PushRoundResult(roundIndex int32, round *proto.Battle
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	if int(roundIndex) < len(s.log.RoundData) && s.log.RoundData[roundIndex].GetWinTeam() != 0 {
-		if !s.closed {
-			s.lastPushAt = time.Now()
-		}
-		return true // Re-ACK a redundant result, even after the battle closes.
-	}
-	if s.closed {
+	// A late peer/report can correct a known round after the first peer closes
+	// the match. It must not introduce new rounds into a closed recording.
+	if s.closed && int(roundIndex) >= len(s.log.RoundData) {
 		return false
 	}
-	s.lastPushAt = time.Now()
+	if !s.closed {
+		s.lastPushAt = time.Now()
+	}
 	for int32(len(s.log.RoundData)) <= roundIndex {
 		s.log.RoundData = append(s.log.RoundData, &proto.BattleLogRound{})
 	}
-	s.log.RoundData[roundIndex] = round
+	previous := s.log.RoundData[roundIndex]
+	outcome := mergeRoundOutcome(previous.GetWinTeam(), round.GetWinTeam())
+	if outcome == previous.GetWinTeam() {
+		return true // Re-ACK duplicates without changing the round-state version.
+	}
+	if outcome == roundOutcomeDraw && previous.GetWinTeam() > 0 && round.GetWinTeam() > 0 {
+		logger.Info("reconcile conflicting legacy round winners as draw",
+			zap.String("battle_code", s.battleCode), zap.Int32("round_index", roundIndex))
+	}
+	// Previously built downlink pushes may still reference the old record.
+	merged := pb.Clone(previous).(*proto.BattleLogRound)
+	merged.WinTeam = outcome
+	if len(merged.UsedMs) == 0 {
+		merged.UsedMs = append([]int32(nil), round.UsedMs...)
+	}
+	s.log.RoundData[roundIndex] = merged
 	s.roundStateVersion++
 	return true
 }
