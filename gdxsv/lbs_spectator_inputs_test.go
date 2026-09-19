@@ -114,7 +114,7 @@ func TestSpectatorSession_PushInputs_FullPendingWindowStillFillsGap(t *testing.T
 		assertEq(t, beforePushAt, s.lastPushAt)
 	}
 
-	// Redundant peers cannot replace values already buffered in the window.
+	// Retries cannot replace values already buffered in the window.
 	s.PushInputs(1, make([]uint64, 128))
 	assertEq(t, 255, len(s.pendingFrames))
 
