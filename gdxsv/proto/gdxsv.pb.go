@@ -829,10 +829,11 @@ func (x *BattleLogRound) GetUsedMs() []int32 {
 	return nil
 }
 
-// Sent by a battle participant every confirmed frame. `inputs` carries every
-// frame the sender thinks LBS hasn't acked yet, starting at start_frame, so a
-// dropped packet delays a frame instead of losing it. All 4 participants send
-// redundantly and LBS dedups by frame index.
+// Legacy participants send confirmed inputs with participant-local absolute
+// start_frame indexes, NOT shared GGPO frames. LBS ACKs each publisher's raw
+// receive position, holds inputs for 500ms, then aligns them using that
+// publisher's ordered round starts before merging into the spectator log.
+// A future round-tagged uplink can bypass this legacy-only holdback.
 //
 // Fields 5 onward are downlink-only (LBS -> spectator). Input, patch and
 // round-state progress are acknowledged independently in SpectatorInputAck.
@@ -1002,9 +1003,10 @@ func (x *SpectatorInputPush) GetRoundStateVersion() int32 {
 	return 0
 }
 
-// Sent by LBS back to a streaming peer, or by a spectator back to LBS: the
-// next missing frame index (the contiguous input count). The other side
-// may discard buffered/backlog data strictly below this index.
+// Sent by LBS back to a streaming peer, or by a spectator back to LBS. The
+// sender may discard buffered inputs strictly below ack_frame. For a legacy
+// participant this is its OWN contiguous received count, including inputs
+// held for normalization. For a spectator it is the canonical log position.
 type SpectatorInputAck struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -1224,9 +1226,11 @@ func (x *SpectatorSubscribeChallenge) GetCookie() []byte {
 	return nil
 }
 
-// Retried until acknowledged, one round start at a time in order (mirrors GdxsvBackendRollback's
-// start_msg_indexes/start_msg_randoms) so the live-assembled log stays
-// deterministic across round boundaries.
+// Legacy participants retry one round start at a time in order (mirrors
+// GdxsvBackendRollback's start_msg_indexes/start_msg_randoms). Its ordinal
+// within that publisher's list identifies the round; frame is a LOCAL input
+// index. Repeated seeds or equal indexes from different publishers are not
+// sufficient to identify retries.
 type SpectatorRoundEvent struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache

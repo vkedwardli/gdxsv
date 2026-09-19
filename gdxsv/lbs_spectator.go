@@ -17,6 +17,9 @@ import (
 // match sends one frame per push; this only grows when acks lag or packets
 // drop. 128 frames is ~2s at 60fps, double GGPO's own pending-output window,
 // and lands around 1KB - well inside one datagram, so no IP fragmentation.
+// Flycast enforces the same limit as kInputPushFrames in
+// core/gdxsv/gdxsv_spectator_downlink.cpp. Changes require client/server
+// coordination, including the client's pending-input queue budget.
 const maxSpectatorPushFrames = 128
 
 // maxSpectatorPendingFrames bounds the out-of-order receive window,
@@ -81,9 +84,10 @@ const spectatorSubscriberTimeout = 10 * time.Second
 const spectatorFanoutInterval = 50 * time.Millisecond
 
 // SpectatorSession holds the live battle log for one in-progress P2P battle,
-// keyed by battle_code. All 4 clients feed it redundantly over LBS's UDP
-// channel. The result has the same shape as the BattleLogFile a client would
-// upload at battle end.
+// keyed by battle_code. Participants use local replay-input ordinals, not a
+// shared GGPO frame number. The legacy adapter aligns each publisher's rounds
+// before adding inputs to the common recording.
+// Round outcomes still use every participant's report to reconcile draws.
 type SpectatorSession struct {
 	mtx sync.RWMutex
 
@@ -92,6 +96,10 @@ type SpectatorSession struct {
 
 	log *proto.BattleLogFile
 
+	// Only the current, absolute-index uplink uses the timed legacy adapter.
+	// The canonical recording and spectator downlink have no holdback policy.
+	legacy spectatorLegacyRecorder
+
 	// pendingFrames holds input frames received ahead of the current
 	// contiguous frontier (log.Inputs), keyed by frame index, until the
 	// gap in front of them is filled. Entries are folded into log.Inputs
@@ -99,8 +107,7 @@ type SpectatorSession struct {
 	// limits this map to maxSpectatorPendingFrames positions.
 	pendingFrames map[int32]uint64
 
-	// roundEventSeen dedups SpectatorRoundEvent pushes: all 4 peers send
-	// the same event, keyed by the frame it occurred at.
+	// roundEventSeen dedups canonical starts (legacy retries are per publisher).
 	roundEventSeen map[int32]bool
 
 	// roundStateVersion increments every time StartMsgIndexes/StartMsgRandoms/
@@ -211,20 +218,23 @@ func newSpectatorSession(matching *proto.P2PMatching, gameDisk string, patches *
 	}
 }
 
-// PushInputs folds a peer's backlog into the session's contiguous input log,
-// deduping by frame index - first arrival across the redundant streams wins.
-//
-// Returns the next frame the session still needs, which the caller sends back
-// so the peer can evict acked entries, and whether the log actually grew, so
-// the caller knows whether to wake the fanout loop.
+// PushInputs accepts inputs already in the canonical recording's coordinates,
+// such as a local replay injection. It has no protocol-specific holdback.
+// Legacy UDP traffic MUST use PushLegacyInputs, not this entry point.
 func (s *SpectatorSession) PushInputs(startFrame int32, inputs []uint64) (ackFrame int32, advanced bool) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	if s.closed {
+		return int32(len(s.log.Inputs)), false
+	}
+	return s.appendInputsLocked(startFrame, inputs)
+}
 
+func (s *SpectatorSession) appendInputsLocked(startFrame int32, inputs []uint64) (ackFrame int32, advanced bool) {
 	before := len(s.log.Inputs)
 	endFrame := int64(startFrame) + int64(len(inputs))
 	// Keep both frame indexes and the next-frame ACK representable as int32.
-	if s.closed || startFrame < 0 || len(inputs) == 0 || endFrame > math.MaxInt32 {
+	if startFrame < 0 || len(inputs) == 0 || endFrame > math.MaxInt32 {
 		return int32(before), false
 	}
 
@@ -233,7 +243,9 @@ func (s *SpectatorSession) PushInputs(startFrame int32, inputs []uint64) (ackFra
 		return int32(before), false
 	}
 
-	s.lastPushAt = time.Now()
+	if !s.closed {
+		s.lastPushAt = time.Now()
+	}
 
 	for i, v := range inputs {
 		f := startFrame + int32(i)
@@ -265,14 +277,18 @@ func (s *SpectatorSession) PushInputs(startFrame int32, inputs []uint64) (ackFra
 	return int32(len(s.log.Inputs)), len(s.log.Inputs) > before
 }
 
-// PushRoundEvent records a round-start RNG seed (mirrors
-// GdxsvBackendRollback's start_msg_indexes_/start_msg_randoms_), deduped by
-// frame since all 4 peers send the same event. True also covers duplicates,
-// including after close, so a lost ACK can be recovered without mutating state.
+// PushRoundEvent records an already-normalized round start. The legacy UDP
+// adapter must first identify its ordinal and translate its local position.
 func (s *SpectatorSession) PushRoundEvent(frame int32, randomValue uint64) bool {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	if s.closed && !s.roundEventSeen[frame] {
+		return false
+	}
+	return s.appendRoundStartLocked(frame, randomValue)
+}
 
+func (s *SpectatorSession) appendRoundStartLocked(frame int32, randomValue uint64) bool {
 	if s.roundEventSeen[frame] {
 		if !s.closed {
 			s.lastPushAt = time.Now()
@@ -280,11 +296,13 @@ func (s *SpectatorSession) PushRoundEvent(frame int32, randomValue uint64) bool 
 		return true
 	}
 	count := len(s.log.StartMsgIndexes)
-	if s.closed || frame < 0 || count >= maxSpectatorRounds ||
+	if frame < 0 || count >= maxSpectatorRounds ||
 		(count > 0 && frame <= s.log.StartMsgIndexes[count-1]) {
 		return false
 	}
-	s.lastPushAt = time.Now()
+	if !s.closed {
+		s.lastPushAt = time.Now()
+	}
 	s.roundEventSeen[frame] = true
 	s.log.StartMsgIndexes = append(s.log.StartMsgIndexes, frame)
 	s.log.StartMsgRandoms = append(s.log.StartMsgRandoms, randomValue)
@@ -487,7 +505,7 @@ func (s *SpectatorSession) buildPush(sub *downlinkSubscriber) (*proto.SpectatorI
 	// Only once this subscriber holds every input and round update. The
 	// spectator stops its downlink on close, so sending it early truncates
 	// the match to whatever had arrived. Resent because close is never acked.
-	needsClose := s.closed && sub.ackedFrame >= have && !needsRoundState
+	needsClose := s.closed && s.legacy.finished() && sub.ackedFrame >= have && !needsRoundState
 
 	if !needsInputs && !needsRoundState && !needsClose {
 		return nil, false
@@ -700,6 +718,10 @@ func (r *SpectatorRegistry) fanoutOnce(udpConn *net.UDPConn) {
 		}
 		r.mtx.Unlock()
 
+		// Time-based release runs even without subscribers or new packets,
+		// including the final buffered tail after a close report.
+		s.flushLegacyLocked(now)
+
 		// buildPush is a pure function of the session log plus one
 		// subscriber's progress (sentHeader/ackedFrame/ackedPatches/
 		// ackedRoundStateVersion): subscribers at the same progress get
@@ -827,8 +849,8 @@ func (r *SpectatorRegistry) GetAny(battleCode string) (*SpectatorSession, bool) 
 //
 // Producing, not merely open: a session is created for every battle, but only
 // peers running a build with the spectator uplink actually push. One such peer
-// is enough - each pushes the whole input log, and the session dedups by frame
-// - so the answer is simply whether any input has arrived.
+// is enough. Legacy input must first pass marker gating and the holdback, so
+// report live once the canonical recording has playable input to publish.
 func (r *SpectatorRegistry) LiveStatus(battleCode string) (live bool, spectators int) {
 	r.mtx.RLock()
 	s, ok := r.sessions[battleCode]
@@ -866,7 +888,7 @@ func handleSpectatorInputPush(udpConn *net.UDPConn, remoteAddr *net.UDPAddr, m *
 	if !ok {
 		return
 	}
-	ackFrame, advanced := s.PushInputs(m.GetStartFrame(), m.GetInputs())
+	ackFrame, advanced := s.PushLegacyInputs(remoteAddr.String(), m.GetStartFrame(), m.GetInputs())
 	if advanced {
 		spectatorRegistry.wakeFanout()
 	}
@@ -894,7 +916,7 @@ func sendSpectatorAck(udpConn *net.UDPConn, remoteAddr *net.UDPAddr, ack *proto.
 // handleSpectatorRoundEvent processes one SpectatorRoundEvent datagram.
 func handleSpectatorRoundEvent(udpConn *net.UDPConn, remoteAddr *net.UDPAddr, m *proto.SpectatorRoundEvent) {
 	s, ok := spectatorRegistry.Get(m.GetBattleCode(), m.GetSessionId())
-	if !ok || !s.PushRoundEvent(m.GetFrame(), m.GetRandomValue()) {
+	if !ok || !s.PushLegacyRoundEvent(remoteAddr.String(), m.GetFrame(), m.GetRandomValue()) {
 		return
 	}
 	sendSpectatorAck(udpConn, remoteAddr, &proto.SpectatorInputAck{

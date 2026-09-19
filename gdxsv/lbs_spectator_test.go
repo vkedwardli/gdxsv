@@ -87,10 +87,10 @@ func TestSpectatorSession_PushInputs_GapThenFill(t *testing.T) {
 	assertEq(t, []uint64{10, 11, 12, 13, 14, 15, 16}, s.log.Inputs)
 }
 
-func TestSpectatorSession_PushInputs_DedupsRedundantPeers(t *testing.T) {
+func TestSpectatorSession_PushInputs_DedupsRetries(t *testing.T) {
 	s := newTestSpectatorSession()
 
-	// Two "different peers" send the same frame range redundantly.
+	// A retry cannot replace inputs already in the canonical recording.
 	s.PushInputs(0, []uint64{1, 2, 3})
 	ack, _ := s.PushInputs(0, []uint64{999, 999, 999}) // must not overwrite
 
@@ -113,7 +113,7 @@ func TestSpectatorSession_PushRoundEvent_DedupsByFrame(t *testing.T) {
 	s := newTestSpectatorSession()
 
 	s.PushRoundEvent(0, 111)
-	s.PushRoundEvent(0, 999) // redundant peer, same frame: ignored
+	s.PushRoundEvent(0, 999) // retry at the same frame: ignored
 	s.PushRoundEvent(500, 222)
 
 	assertEq(t, []int32{0, 500}, s.log.StartMsgIndexes)
