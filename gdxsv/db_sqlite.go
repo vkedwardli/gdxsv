@@ -868,7 +868,7 @@ func (db SQLiteDB) FindReplay(q *FindReplayQuery) ([]*FoundReplay, error) {
 		"used_ms":     q.UsedMs,
 		"page":        q.Page,
 	}
-	var playerFilters strings.Builder
+	var playerConditions []string
 	for _, filter := range []struct {
 		column string
 		op     string
@@ -880,16 +880,43 @@ func (db SQLiteDB) FindReplay(q *FindReplayQuery) ([]*FoundReplay, error) {
 	} {
 		for i, value := range filter.values {
 			name := fmt.Sprintf("%s_%d", filter.column, i)
-			// All filters must match this battle, possibly across different
-			// participants. Only fixed column/operator names enter the SQL;
-			// user values remain bound parameters.
+			// Only fixed column/operator names enter the SQL; user values
+			// remain bound parameters.
+			playerConditions = append(playerConditions, fmt.Sprintf("%s %s :%s", filter.column, filter.op, name))
+			args[name] = value
+		}
+	}
+
+	var playerFilters strings.Builder
+	for i, condition := range playerConditions {
+		if i == 0 {
+			// Anchor the first filter on the driving row, avoiding an EXISTS
+			// lookup for the common single-player search.
+			fmt.Fprintf(&playerFilters, "\n    AND battle.%s", condition)
+			continue
+		}
+		// The remaining filters may match different participants.
+		fmt.Fprintf(&playerFilters, `
+    AND EXISTS (
+      SELECT 1 FROM battle_record AS player
+      WHERE player.battle_code = battle.battle_code
+        AND player.team != 0
+        AND player.%s)`, condition)
+	}
+	if q.UsedMs != -1 {
+		if len(playerConditions) <= 1 {
+			// No player filter: anyone. One filter: that matching participant.
+			playerFilters.WriteString("\n    AND (battle.used_ms_mask & (1 << :used_ms)) != 0")
+		} else {
+			// Any filtered participant may have used the MS, not just the
+			// first one. Filter order must not change the result.
 			fmt.Fprintf(&playerFilters, `
     AND EXISTS (
       SELECT 1 FROM battle_record AS player
       WHERE player.battle_code = battle.battle_code
         AND player.team != 0
-        AND player.%s %s :%s)`, filter.column, filter.op, name)
-			args[name] = value
+        AND (player.used_ms_mask & (1 << :used_ms)) != 0
+        AND (player.%s))`, strings.Join(playerConditions, " OR player."))
 		}
 	}
 
@@ -923,8 +950,7 @@ WHERE battle_code IN (
     AND (battle_code = :battle_code OR :battle_code = '')
     AND (lobby_id = :lobby_id OR :lobby_id = -1)
     AND (players = :players OR :players = -1)
-    AND (aggregate = :aggregate OR :aggregate = -1)
-    AND (:used_ms = -1 OR (used_ms_mask & (1 << :used_ms)) != 0)`+playerFilters.String()+`
+    AND (aggregate = :aggregate OR :aggregate = -1)`+playerFilters.String()+`
   ORDER BY created `+order+` LIMIT 100 OFFSET (:page) * 100)
 GROUP BY battle_code ORDER BY created `+order, args)
 	if err != nil {

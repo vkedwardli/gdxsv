@@ -64,6 +64,8 @@ func TestReplayPlayerFilters(t *testing.T) {
 	insertReplayFilterBattle(t, db, "ac", "dc2", 2, 2, a, c)
 	insertReplayFilterBattle(t, db, "bc", "dc1", 4, 3, b, c)
 	insertReplayFilterBattle(t, db, "abcd", "dc2", 2, 4, a, b, c, d)
+	_, err := db.Exec("UPDATE battle_record SET aggregate = 0 WHERE battle_code = ?", "ac")
+	must(t, err)
 	allUsers := map[string][]string{
 		"ab":   {a.UserID, b.UserID},
 		"ac":   {a.UserID, c.UserID},
@@ -98,10 +100,17 @@ func TestReplayPlayerFilters(t *testing.T) {
 		{"comma_is_not_a_separator", url.Values{"user_id": {a.UserID + "," + b.UserID}}, nil},
 		{"sql_is_bound", url.Values{"user_name": {"' OR 1=1 --"}}, nil},
 		{"disk", url.Values{"user_id": {b.UserID, c.UserID}, "disk": {"dc1"}}, []string{"bc"}},
+		{"disk_mismatch", url.Values{"user_id": {a.UserID, b.UserID}, "disk": {"dc1"}}, nil},
 		{"lobby", url.Values{"user_id": {b.UserID, c.UserID}, "lobby_id": {"4"}}, []string{"bc"}},
+		{"lobby_mismatch", url.Values{"user_id": {a.UserID, b.UserID}, "lobby_id": {"4"}}, nil},
 		{"player_count", url.Values{"user_id": {a.UserID, b.UserID}, "players": {"2"}}, []string{"ab"}},
+		{"player_count_four", url.Values{"user_id": {a.UserID, b.UserID}, "players": {"4"}}, []string{"abcd"}},
+		{"player_count_mismatch", url.Values{"user_id": {a.UserID, b.UserID}, "players": {"3"}}, nil},
 		{"battle_code", url.Values{"user_id": {a.UserID, b.UserID}, "battle_code": {"ab"}}, []string{"ab"}},
+		{"battle_code_mismatch", url.Values{"user_id": {a.UserID, b.UserID}, "battle_code": {"ac"}}, nil},
 		{"aggregate", url.Values{"user_id": {a.UserID, b.UserID}, "aggregate": {"0"}}, nil},
+		{"ranked", url.Values{"user_id": {a.UserID, b.UserID}, "aggregate": {"1"}}, []string{"abcd", "ab"}},
+		{"unranked", url.Values{"user_id": {a.UserID, c.UserID}, "aggregate": {"0"}}, []string{"ac"}},
 		{"used_ms", url.Values{"user_id": {a.UserID, b.UserID}, "used_ms": {"7"}}, nil},
 		{"reverse", url.Values{"user_id": {a.UserID, b.UserID}, "reverse": {"1"}}, []string{"ab", "abcd"}},
 		{"empty_page", url.Values{"user_id": {a.UserID, b.UserID}, "page": {"1"}}, nil},
@@ -139,6 +148,81 @@ func TestReplayPlayerFilters(t *testing.T) {
 		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/lbs/replay?user_name=%", nil))
 		assertEq(t, http.StatusBadRequest, rec.Code)
 	})
+}
+
+func TestReplayPlayerFiltersUsedMS(t *testing.T) {
+	db, mux := replayFilterTestServer(t)
+	a := ReplayUser{UserID: "AAA111", UserName: "Alice", PilotName: "Ace"}
+	b := ReplayUser{UserID: "BBB222", UserName: "Bob", PilotName: "Bravo"}
+	c := ReplayUser{UserID: "CCC333", UserName: "Carol", PilotName: "Charlie"}
+	d := ReplayUser{UserID: "DDD444", UserName: "Dave", PilotName: "Delta"}
+	insertReplayFilterBattle(t, db, "abcd", "dc2", 2, 1, a, b, c, d)
+	// Different masks expose accidentally matching an unrelated participant.
+	for i, user := range []ReplayUser{a, b, c, d} {
+		ms := []int{3, 7, 9, 10}[i]
+		must(t, db.SaveUserUsedMs("abcd", user.UserID, 1<<ms, fmt.Sprint(ms)))
+	}
+
+	for _, tt := range []struct {
+		name  string
+		query url.Values
+		ms    int
+		match bool
+	}{
+		{"any_player", nil, 7, true},
+		{"unused_ms", nil, 30, false},
+		{"single_id_own_ms", url.Values{"user_id": {a.UserID}}, 3, true},
+		{"single_id_other_ms", url.Values{"user_id": {a.UserID}}, 7, false},
+		{"single_hn_own_ms", url.Values{"user_name": {"%lic%"}}, 3, true},
+		{"single_hn_other_ms", url.Values{"user_name": {"%lic%"}}, 7, false},
+		{"single_pn_own_ms", url.Values{"pilot_name": {"%rav%"}}, 7, true},
+		{"single_pn_other_ms", url.Values{"pilot_name": {"%rav%"}}, 3, false},
+		{"two_ids_first_ms", url.Values{"user_id": {a.UserID, b.UserID}}, 3, true},
+		{"two_ids_second_ms", url.Values{"user_id": {a.UserID, b.UserID}}, 7, true},
+		{"two_ids_unrelated_ms", url.Values{"user_id": {a.UserID, b.UserID}}, 9, false},
+		{"reversed_ids_first_ms", url.Values{"user_id": {b.UserID, a.UserID}}, 3, true},
+		{"reversed_ids_second_ms", url.Values{"user_id": {b.UserID, a.UserID}}, 7, true},
+		{"reversed_ids_unrelated_ms", url.Values{"user_id": {b.UserID, a.UserID}}, 9, false},
+		{"two_hns_second_ms", url.Values{"user_name": {"%lic%", "%ob%"}}, 7, true},
+		{"two_hns_unrelated_ms", url.Values{"user_name": {"%lic%", "%ob%"}}, 9, false},
+		{"two_pns_second_ms", url.Values{"pilot_name": {"%Ace%", "%Bravo%"}}, 7, true},
+		{"two_pns_unrelated_ms", url.Values{"pilot_name": {"%Ace%", "%Bravo%"}}, 9, false},
+		{"id_and_hn_ms", url.Values{"user_id": {a.UserID}, "user_name": {"%ob%"}}, 7, true},
+		{"id_and_hn_unrelated_ms", url.Values{"user_id": {a.UserID}, "user_name": {"%ob%"}}, 9, false},
+		{"id_and_pn_ms", url.Values{"user_id": {a.UserID}, "pilot_name": {b.PilotName}}, 7, true},
+		{"id_and_pn_unrelated_ms", url.Values{"user_id": {a.UserID}, "pilot_name": {b.PilotName}}, 9, false},
+		{"hn_and_pn_ms", url.Values{"user_name": {a.UserName}, "pilot_name": {b.PilotName}}, 7, true},
+		{"three_fields_ms", url.Values{"user_id": {a.UserID}, "user_name": {b.UserName}, "pilot_name": {c.PilotName}}, 9, true},
+		{"three_fields_unrelated_ms", url.Values{"user_id": {a.UserID}, "user_name": {b.UserName}, "pilot_name": {c.PilotName}}, 10, false},
+		{"four_ids_last_ms", url.Values{"user_id": {a.UserID, b.UserID, c.UserID, d.UserID}}, 10, true},
+		{"overlapping_patterns_ms", url.Values{"user_name": {"A%", "%ice"}}, 3, true},
+		{"overlapping_patterns_unrelated_ms", url.Values{"user_name": {"A%", "%ice"}}, 7, false},
+		{"missing_required_player", url.Values{"user_id": {a.UserID, "ZZZ999"}}, 3, false},
+		{"all_battle_filters", url.Values{"user_id": {a.UserID, b.UserID}, "lobby_id": {"2"}, "players": {"4"}, "battle_code": {"abcd"}, "aggregate": {"1"}, "disk": {"dc2"}}, 7, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			query := tt.query
+			if query == nil {
+				query = make(url.Values)
+			}
+			query.Set("used_ms", fmt.Sprint(tt.ms))
+			status := http.StatusNoContent
+			if tt.match {
+				status = http.StatusOK
+			}
+			replays := requestReplayFilters(t, mux, query, status)
+			if tt.match {
+				assertEq(t, 1, len(replays))
+				assertEq(t, "abcd.pb", replays[0].ReplayURL)
+				// The result must still contain everyone, not just MS users.
+				var ids []string
+				for _, user := range replays[0].Users {
+					ids = append(ids, user.UserID)
+				}
+				assertEq(t, []string{a.UserID, b.UserID, c.UserID, d.UserID}, ids)
+			}
+		})
+	}
 }
 
 func TestReplayPlayerFilterPagination(t *testing.T) {
