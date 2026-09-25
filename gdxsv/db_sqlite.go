@@ -859,6 +859,40 @@ func (db SQLiteDB) FindReplay(q *FindReplayQuery) ([]*FoundReplay, error) {
 		order = "ASC"
 	}
 
+	args := map[string]interface{}{
+		"disk":        q.Disk,
+		"battle_code": q.BattleCode,
+		"lobby_id":    q.LobbyID,
+		"players":     q.Players,
+		"aggregate":   q.Aggregate,
+		"used_ms":     q.UsedMs,
+		"page":        q.Page,
+	}
+	var playerFilters strings.Builder
+	for _, filter := range []struct {
+		column string
+		op     string
+		values []string
+	}{
+		{"user_id", "=", q.UserIDs},
+		{"user_name", "LIKE", q.UserNames},
+		{"pilot_name", "LIKE", q.PilotNames},
+	} {
+		for i, value := range filter.values {
+			name := fmt.Sprintf("%s_%d", filter.column, i)
+			// All filters must match this battle, possibly across different
+			// participants. Only fixed column/operator names enter the SQL;
+			// user values remain bound parameters.
+			fmt.Fprintf(&playerFilters, `
+    AND EXISTS (
+      SELECT 1 FROM battle_record AS player
+      WHERE player.battle_code = battle.battle_code
+        AND player.team != 0
+        AND player.%s %s :%s)`, filter.column, filter.op, name)
+			args[name] = value
+		}
+	}
+
 	rows, err := db.NamedQuery(`
 SELECT
   disk,
@@ -882,20 +916,17 @@ WHERE battle_code IN (
   SELECT DISTINCT
     battle_code
   FROM
-    battle_record
+    battle_record AS battle
   WHERE
     replay_url != '' AND team != 0
     AND (disk = :disk OR :disk = '')
     AND (battle_code = :battle_code OR :battle_code = '')
-    AND (user_id = :user_id OR :user_id = '')
-    AND (user_name LIKE :user_name OR :user_name = '')
-    AND (pilot_name LIKE :pilot_name OR :pilot_name = '')
     AND (lobby_id = :lobby_id OR :lobby_id = -1)
     AND (players = :players OR :players = -1)
     AND (aggregate = :aggregate OR :aggregate = -1)
-    AND (:used_ms = -1 OR (used_ms_mask & (1 << :used_ms)) != 0)
+    AND (:used_ms = -1 OR (used_ms_mask & (1 << :used_ms)) != 0)`+playerFilters.String()+`
   ORDER BY created `+order+` LIMIT 100 OFFSET (:page) * 100)
-GROUP BY battle_code ORDER BY created `+order, q)
+GROUP BY battle_code ORDER BY created `+order, args)
 	if err != nil {
 		return nil, err
 	}
